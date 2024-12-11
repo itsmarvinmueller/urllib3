@@ -347,6 +347,11 @@ class BaseHTTPResponse(io.IOBase):
         self._decoder: ContentDecoder | None = None
         self.length_remaining: int | None
 
+        # Boolean to indecate that some elements of the request are deprecated.
+        self.deprecated: bool | None = None
+        # A list of deprecated parameter if existent.
+        self.deprecated_parameter: list[str] | None = None
+
     def get_redirect_location(self) -> str | None | typing.Literal[False]:
         """
         Should we redirect and where to?

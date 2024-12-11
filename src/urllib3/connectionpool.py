@@ -10,6 +10,13 @@ import weakref
 from socket import timeout as SocketTimeout
 from types import TracebackType
 
+from .deprecation import get_deprecation_detection, is_operation_deprecated, are_parameter_deprecated, create_log, get_deprecation_http_header, get_logging_configuration, get_slack_configuration, get_jira_configuration
+from .jira import create_base64_auth, create_new_jira_issue, check_if_issue_exists
+from .slack import send_deprecation_webhook_slack, check_if_already_send
+import yaml
+import json
+import datetime
+
 from ._base_connection import _TYPE_BODY
 from ._collections import HTTPHeaderDict
 from ._request_methods import RequestMethods
@@ -958,6 +965,118 @@ class HTTPConnectionPool(ConnectionPool, RequestMethods):
                 decode_content=decode_content,
                 **response_kw,
             )
+        
+        # Check if deprecation analysis should be performed.
+        if not url.endswith(('openapi.yaml', 'openapi.json')) and get_deprecation_detection():
+            # First try to get the information from the HTTP header to avoid a possible second request.
+            HTTP_DEPRECATION_HEADER = ["sunset", "deprecation"]
+            # Add the custom http header from the user to the existing list.
+            lower_custom_deprecation_header = [header.lower() for header in get_deprecation_http_header()]
+            HTTP_DEPRECATION_HEADER.extend(lower_custom_deprecation_header)
+            # Calculate if a HTTP header that indicates deprecation are found in the HTTP header of the response.
+            response_lower_header = [header.lower() for header in response.headers.keys()]
+            http_deprecation = bool(set(HTTP_DEPRECATION_HEADER).intersection(response_lower_header))
+            # Default value for if the OAS was not found or the path is not valid, we set the deprecation booleans to false to get no false positives.
+            operation_deprecated = False
+            parameter_deprecated = False
+            # Default value for the list of deprecated parameter.
+            deprecated_parameter = []
+
+            # If HTTP was not enough get the OAS if possible.
+            if not http_deprecation:
+                # Build the initial OAS url.
+                oas_url = self.scheme + "://" + self.host + ":" + str(self.port) + parsed_url.path
+                # Split the url. Remove everything after the last slash and save it to build the path.
+                path = oas_url[oas_url.rfind('/'):]
+                oas_url = oas_url[:oas_url.rfind('/')]
+                oas_search = True
+
+                # Search for the OAS. This is a difficult task because there is no rule where to store the file and how to name it. Here we take the file name specified in the OAS 3.0 and shrink the url of the request one step at the time.
+                while(oas_search):
+                    # Because of the spliting of the url it could change the host. If this happens, we stop the search, because most of the time we already left the API territory.
+                    try:
+                        # Try to get the OAS in JSON format with the current url.
+                        oas_response = self.urlopen("GET", oas_url + "/openapi.json")
+                        if oas_response.status == 200:
+                            try:
+                                possibleOas = oas_response.json()
+                                if (possibleOas["openapi"] and possibleOas["info"]):
+                                    oas = possibleOas
+                                    break
+                            except TypeError:
+                                # We called an other endpoint that returned no json.
+                                pass
+                            except KeyError:
+                                # The returned json is no OpenAPI-Document.
+                                pass  
+
+                        # Try to get the OAS in YAML format with the current url.
+                        oas_response = self.urlopen("GET", oas_url + "/openapi.yaml")
+                        if oas_response.status == 200:
+                            try:
+                                yaml_data = yaml.safe_load(oas_response.data)
+                                json_data = json.dumps(yaml_data, indent=4)
+                                possibleOas = json.loads(json_data)
+                                if (possibleOas["openapi"] and possibleOas["info"]):
+                                    oas = possibleOas
+                                    break
+                            except TypeError:
+                                # We called an other endpoint that returned no json.
+                                pass
+                            except KeyError:
+                                # The returned json is no OpenAPI-Document.
+                                pass
+
+                        # Set new url for OAS search or end search if search url is only the url host section.
+                        if oas_url != self.scheme + "://" + self.host + ":" + str(self.port):
+                            path = oas_url[oas_url.rfind('/'):] + path
+                            oas_url = oas_url[:oas_url.rfind('/')]
+                        else:
+                            oas_search = False
+                    except HostChangedError:
+                        oas_search = False
+
+                # If the OAS was found parse those to find deprecated elements.
+                if oas_search and path.startswith("/"):
+                    operation_deprecated = is_operation_deprecated(oas, path, method)
+                    if parsed_url.query != None:
+                        request_parameter = [query_element.split("=")[0] for query_element in parsed_url.query.split("&")]
+                        parameter_deprecated, deprecated_parameter = are_parameter_deprecated(oas, path, method, request_parameter)         
+
+            # Build a combined boolean out of the differnt parts.
+            response.deprecated = http_deprecation or operation_deprecated or parameter_deprecated
+            response.deprecated_parameter = deprecated_parameter
+
+            # If something is deprecated, extract the necessary values and inform the developer.
+            if response.deprecated:
+                # Get HTTP header if existing
+                try:
+                    header_value = response.headers.get("deprecation")
+                    timestamp = float(header_value.split("@")[1])
+                    http_deprecation_datetime = datetime.datetime.fromtimestamp(timestamp, datetime.timezone.utc)
+                except:
+                    http_deprecation_datetime = None
+                try: 
+                    header_value = response.headers.get("sunset")
+                    http_sunset_datetime = datetime.datetime.strptime(header_value, "%a, %d %b %Y %H:%M:%S %Z")
+                except:
+                    http_sunset_datetime = None
+
+                # Create deprecation url.
+                deprecation_url = self.scheme + "://" + self.host + ":" + str(self.port) + url
+
+                # Make the developer aware of the deprecation.
+                if get_logging_configuration():
+                    create_log(get_logging_configuration(), deprecation_url, method, deprecated_parameter=deprecated_parameter if parameter_deprecated else None, deprecation_datetime=http_deprecation_datetime, sunset_datetime=http_sunset_datetime)
+                if get_slack_configuration():
+                    exists = check_if_already_send(get_slack_configuration(), deprecation_url, method, deprecated_parameter=deprecated_parameter if parameter_deprecated else None, deprecation_datetime=http_deprecation_datetime, sunset_datetime=http_sunset_datetime)
+                    if not exists:
+                        send_deprecation_webhook_slack(get_slack_configuration(), deprecation_url, method, deprecated_parameter=deprecated_parameter if parameter_deprecated else None, deprecation_datetime=http_deprecation_datetime, sunset_datetime=http_sunset_datetime)
+                if get_jira_configuration():
+                    config = create_base64_auth(get_jira_configuration())
+                    exists = check_if_issue_exists(config, deprecation_url, method, deprecated_parameter=deprecated_parameter if parameter_deprecated else None, deprecation_datetime=http_deprecation_datetime, sunset_datetime=http_sunset_datetime)
+                    if not exists:
+                        create_new_jira_issue(config, deprecation_url, method, deprecated_parameter=deprecated_parameter if parameter_deprecated else None, deprecation_datetime=http_deprecation_datetime, sunset_datetime=http_sunset_datetime)
 
         return response
 
